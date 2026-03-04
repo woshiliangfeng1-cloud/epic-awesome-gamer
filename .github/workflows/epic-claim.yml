@@ -79,7 +79,7 @@ jobs:
           retention-days: 7
 
       - name: Notify via WeCom
-        if: always() && secrets.WECOM_WEBHOOK_URL != ''
+        if: always()
         run: |
           STATUS="${{ steps.claim.outputs.status }}"
           GAMES="${{ steps.claim.outputs.games }}"
