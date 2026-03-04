@@ -1,0 +1,100 @@
+name: Epic Free Games Auto Claim
+
+on:
+  schedule:
+    # 每周五 00:30 UTC+8 = 周四 16:30 UTC（Epic 周四晚换游戏）
+    - cron: '30 16 * * 4'
+  workflow_dispatch:
+    # 支持手动触发
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        run: |
+          # 创建 .env 文件
+          cat > docker/.env << EOF
+          EPIC_EMAIL=${{ secrets.EPIC_EMAIL }}
+          EPIC_PASSWORD=${{ secrets.EPIC_PASSWORD }}
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          ENABLE_APSCHEDULER=false
+          EXECUTION_TIMEOUT=180
+          RESPONSE_TIMEOUT=60
+          RETRY_ON_FAILURE=true
+          DISABLE_BEZIER_TRAJECTORY=true
+          CONSTRAINT_RESPONSE_SCHEMA=true
+          IMAGE_CLASSIFIER_THINKING_BUDGET=970
+          SPATIAL_POINT_THINKING_BUDGET=1387
+          SPATIAL_PATH_THINKING_BUDGET=1652
+          EOF
+
+      - name: Pull Docker image
+        run: docker pull ghcr.io/qin2dim/epic-awesome-gamer:latest
+
+      - name: Run Epic claim
+        id: claim
+        run: |
+          mkdir -p /tmp/epic-volumes
+
+          # 运行容器并捕获日志
+          docker run --rm \
+            --env-file docker/.env \
+            --shm-size=2g \
+            -v /tmp/epic-volumes:/app/app/volumes \
+            ghcr.io/qin2dim/epic-awesome-gamer:latest \
+            xvfb-run --auto-servernum --server-num=1 \
+            --server-args='-screen 0, 1920x1080x24' \
+            uv run app/deploy.py 2>&1 | tee /tmp/epic-run.log
+
+          # 解析结果
+          if grep -q "Successfully collected all weekly games" /tmp/epic-run.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            # 提取游戏名
+            GAMES=$(grep "Discover promotion" /tmp/epic-run.log | \
+              grep -o '"title": "[^"]*"' | \
+              sed 's/"title": "//g' | \
+              sed 's/"//g' | \
+              awk '{print "• "$0}' | head -20)
+            echo "games<<EOF" >> $GITHUB_OUTPUT
+            echo "$GAMES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          elif grep -q "All week-free games are already in the library" /tmp/epic-run.log; then
+            echo "status=already_owned" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epic-logs-${{ github.run_id }}
+          path: /tmp/epic-run.log
+          retention-days: 7
+
+      - name: Notify via WeCom
+        if: always() && secrets.WECOM_WEBHOOK_URL != ''
+        run: |
+          STATUS="${{ steps.claim.outputs.status }}"
+          GAMES="${{ steps.claim.outputs.games }}"
+          DATE=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$STATUS" = "success" ]; then
+            CONTENT="🎮 **Epic 免费游戏领取成功！**\n\n本周领取：\n${GAMES}\n\n时间：${DATE}\n[查看日志](${RUN_URL})"
+          elif [ "$STATUS" = "already_owned" ]; then
+            CONTENT="ℹ️ **Epic 周免游戏已在库中**，无需重复领取。\n\n时间：${DATE}"
+          else
+            CONTENT="❌ **Epic 游戏领取失败**，请检查账号配置。\n\n时间：${DATE}\n[查看日志](${RUN_URL})"
+          fi
+
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"${CONTENT}\"}}" \
+            "${{ secrets.WECOM_WEBHOOK_URL }}"
